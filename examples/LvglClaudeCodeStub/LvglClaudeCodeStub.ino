@@ -36,9 +36,12 @@
  *   - Board: ESP32P4 Dev Module
  *   - PSRAM: Enabled
  *   - Flash Size: 32 MegaBytes (256 megabits)
- *   - USB CDC On Boot: Disabled  <- bottom USB-C port (CH340 into UART0)
+ *   - Partition Scheme: Custom (uses the partitions.csv in this sketch folder)
+ *   - USB CDC On Boot: Disabled  <- bottom USB-C port (CH343P into UART0)
  *                                  Enabled for the top port (native USB);
- *                                  Enabled costs ~50 KB of internal DRAM.
+ *                                  Enabled costs ~57 KB of internal RAM
+ *                                  (measured; see the board library's
+ *                                  README-board.md).
  *                                  Serial0 is always UART0 = bottom port,
  *                                  whichever way this is set.
  *
@@ -65,10 +68,10 @@
 void setup() {
     Serial0.begin(115200);
 
-    // Mounted sideways?  Uncomment to rotate the UI 90 degrees so it reads
+    // Mounted sideways?  Uncomment to rotate the UI 270 degrees so it reads
     // upright, with the USB ports and buttons along the bottom edge where they
     // are least visible.  Accepts 0, 90, 180 or 270.
-    // display.setRotation(90);
+    // display.setRotation(270);
 
     // Initialize display, touch, and LVGL (touch transform is automatic)
     //

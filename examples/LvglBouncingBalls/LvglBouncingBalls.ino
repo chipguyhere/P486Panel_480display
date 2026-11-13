@@ -27,9 +27,12 @@
  *   - Board: ESP32P4 Dev Module
  *   - PSRAM: Enabled
  *   - Flash Size: 32 MegaBytes (256 megabits)
- *   - USB CDC On Boot: Disabled  <- bottom USB-C port (CH340 into UART0)
+ *   - Partition Scheme: Custom (uses the partitions.csv in this sketch folder)
+ *   - USB CDC On Boot: Disabled  <- bottom USB-C port (CH343P into UART0)
  *                                  Enabled for the top port (native USB);
- *                                  Enabled costs ~50 KB of internal DRAM.
+ *                                  Enabled costs ~57 KB of internal RAM
+ *                                  (measured; see the board library's
+ *                                  README-board.md).
  *                                  Serial0 is always UART0 = bottom port,
  *                                  whichever way this is set.
  *
@@ -47,17 +50,17 @@
 #include "ui.h"
 
 void setup() {
-    // Note: Serial0 is always UART0, which is the BOTTOM USB-C port (the CH340
+    // Note: Serial0 is always UART0, which is the BOTTOM USB-C port (the CH343P
     // bridge) -- regardless of the "USB CDC On Boot" setting.  That setting only
     // decides what plain `Serial` means: the native-USB device on the top port
     // when Enabled, or an alias for Serial0 when Disabled.  Leaving it Disabled
-    // saves ~50 KB of internal DRAM.
+    // saves ~57 KB of internal RAM (measured).
     Serial0.begin(115200);
 
-    // Mounted sideways?  Uncomment to rotate the UI 90 degrees so it reads
+    // Mounted sideways?  Uncomment to rotate the UI 270 degrees so it reads
     // upright, with the USB ports and buttons along the bottom edge where they
     // are least visible.  Accepts 0, 90, 180 or 270.
-    // display.setRotation(90);
+    // display.setRotation(270);
 
     // Initialize display, touch, and LVGL (touch transform is automatic).
     // The UI adapts to whatever resolution the display reports.

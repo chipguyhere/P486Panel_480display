@@ -20,7 +20,7 @@
  *  handles all four orientations; to rotate, uncomment the setRotation() line
  *  in the .ino, before lv_setup.begin():
  *
- *      display.setRotation(90);   // 0, 90, 180 or 270
+ *      display.setRotation(270);   // 0, 90, 180 or 270
  *
  *  Rotation is free: the PPA is already running on every flush to scale
  *  480x480 up to 720x720, and rotation is just another field in that same

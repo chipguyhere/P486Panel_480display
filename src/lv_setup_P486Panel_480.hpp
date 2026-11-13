@@ -15,6 +15,9 @@
  *
  *       display.setRotation(0 | 90 | 180 | 270);
  *
+ *   The picture turns clockwise (the usual Arduino convention), so a panel
+ *   mounted turned a quarter-turn clockwise - USB ports down - wants 270.
+ *
  *   in your sketch BEFORE lv_setup.begin(); omit it and you get 0.  The PPA
  *   applies the rotation while it scales, and _touchpad_read below applies the
  *   matching inverse transform so touch stays aligned with what's on screen.
@@ -31,6 +34,9 @@
  *   DMA framebuffers, which is then made active.  LVGL runs in DIRECT render
  *   mode with two buffers, so a flush is a scale-and-page-flip rather than a
  *   blit.  Touch arrives in native 720x720 space and is scaled down by 2/3.
+ *
+ * Copyright (c) 2024-2026 chipguyhere
+ * MIT License — see LICENSE
  */
 
 #pragma once
@@ -81,9 +87,16 @@ static_assert(_cg_fqbn_contains(ARDUINO_FQBN, "FlashSize=32M"),
     "or define CHIPGUY_ALLOW_ANY_FLASH_SIZE if this sketch deliberately targets a smaller one.");
 #endif
 
+#include <P486Panel_Board.h>                   // shared I2C bus + pin map
 #include <chipguy_P486Panel_480display.h>
-#include <chipguy_P486Panel_touch.h>
+#include "chipguy_P486Panel_touch.h"   // this library's own copy (both display libraries ship one)
 #include "esp_cache.h"
+
+// The board owns the shared I2C bus (GPIO7/8); the touch controller is on it,
+// alongside the audio codec, the microphone ADC and the P3 header.  Use
+// board.Wire for any of those — never ::Wire.begin() on other pins.  The
+// relays are board.setRelay(0|1, on).
+static P486Panel_Board board;
 
 static chipguy_P486Panel_480display display;
 
@@ -135,6 +148,7 @@ public:
         }
         Serial0.println("Display initialized");
 
+        board.begin();          // the shared I2C bus; idempotent
         _touchscreen.begin();
 
         _drawBuf0 = (uint8_t *)display.getDrawBuffer(0);
@@ -157,7 +171,7 @@ public:
     }
 
 private:
-    chipguy_P486Panel_touch _touchscreen;
+    chipguy_P486Panel_touch _touchscreen{board.Wire};
     uint8_t *_drawBuf0 = nullptr;
     uint8_t *_drawBuf1 = nullptr;
     size_t _drawBufSize = 0;
@@ -181,18 +195,11 @@ private:
 
     static void _touchpad_read(lv_indev_t *indev, lv_indev_data_t *data) {
         auto *self = (lv_setup_class *)lv_indev_get_user_data(indev);
-        esp_lcd_touch_handle_t tp = self->_touchscreen.getHandle();
-        if (!tp) {
-            data->state = LV_INDEV_STATE_RELEASED;
-            return;
-        }
-
+        // Reads up to TOUCH_MAX_POINTS contacts; LVGL's pointer consumes the
+        // first.  A fork that wants multi-touch has the rest in x[1..cnt-1].
         uint16_t x[TOUCH_MAX_POINTS], y[TOUCH_MAX_POINTS];
-        uint16_t strength[TOUCH_MAX_POINTS];
-        uint8_t cnt = 0;
-
-        esp_lcd_touch_read_data(tp);
-        bool pressed = esp_lcd_touch_get_coordinates(tp, x, y, strength, &cnt, TOUCH_MAX_POINTS);
+        uint8_t cnt = self->_touchscreen.readPoints(x, y, TOUCH_MAX_POINTS);
+        bool pressed = cnt > 0;
 
         if (pressed && cnt > 0) {
             // Raw touch coordinates are in native 720x720 panel space.
@@ -202,8 +209,9 @@ private:
             int32_t ty = (int32_t)y[0];
 
             switch (display.getRotation()) {
-                case 90:
-                    // PPA rotated the image 90 degrees CCW; undo that for touch.
+                case 270:
+                    // PPA rotated the image 90 degrees CCW (rotation 270 =
+                    // 270 clockwise); undo that for touch.
                     // Inverse touch transform: sx = 479 - ty/1.5, sy = tx/1.5
                     data->point.x = 479 - ty * 2 / 3;
                     data->point.y = tx * 2 / 3;
@@ -212,7 +220,8 @@ private:
                     data->point.x = 479 - tx * 2 / 3;
                     data->point.y = 479 - ty * 2 / 3;
                     break;
-                case 270:
+                case 90:
+                    // PPA rotated the image 90 degrees CW (PPA 270 CCW).
                     data->point.x = ty * 2 / 3;
                     data->point.y = 479 - tx * 2 / 3;
                     break;

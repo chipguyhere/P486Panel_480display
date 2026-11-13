@@ -1,15 +1,19 @@
 /*
  * SPDX-FileCopyrightText: 2023-2025 Espressif Systems (Shanghai) CO LTD
- * SPDX-FileCopyrightText: 2024 chipguyhere
+ * SPDX-FileCopyrightText: 2024-2026 chipguyhere
  * SPDX-License-Identifier: Apache-2.0
  *
- * ESP32-P4 MIPI DSI DPI Panel Driver with Hardware Scrolling
- * Forked from ESP-IDF v5.5 esp_lcd_panel_dpi.c
- *
- * Supports:
- * - Hardware vertical scrolling (any row offset, wrap-around)
- * - Hardware horizontal scrolling (8-pixel granularity due to 16-byte DMA alignment)
- * - Virtual framebuffer for pre-drawing content ahead of scroll position
+ * ESP32-P4 MIPI DSI DPI Panel Driver with page flipping and hardware scrolling
+ * Forked from ESP-IDF v5.5 esp_lcd_panel_dpi.c, and modified:
+ * - the DMA descriptor list is rebuilt at every frame boundary, so a page flip
+ *   (chipguy_lcd_dpi_panel_set_active_fb) never tears;
+ * - each frame is fed as up to four regions -- a frozen top band, a window
+ *   into a ring of rows (split in two where it wraps), a frozen bottom band --
+ *   so text can scroll in hardware between a fixed header and footer
+ *   (chipguy_lcd_dpi_panel_set_layout);
+ * - the framebuffer may be taller than the panel (virtual_v_pixels), giving
+ *   the ring spare rows to draw into before they scroll into view;
+ * - frame and underrun counters, and vsync waiting.
  */
 
 #ifdef ARDUINO_ESP32P4_DEV
@@ -41,7 +45,9 @@
 
 #include "esp_lcd_panel_dpi_bb.h"
 
-// Copy the private bus structure definition from mipi_dsi_priv.h
+// Copy the private bus structure definition from mipi_dsi_priv.h.  Only bus_id and
+// hal are read; chipguy_lcd_new_panel_dpi() checks both against the HAL's register
+// pointers, so a layout change in ESP-IDF fails there instead of driving garbage.
 typedef struct esp_lcd_dsi_bus_t {
     int bus_id;
     mipi_dsi_hal_context_t hal;
@@ -51,8 +57,13 @@ typedef struct esp_lcd_dsi_bus_t {
 static const char *TAG = "chipguy_dpi";
 
 #define DPI_PANEL_MAX_FB_NUM 3
-#define STANDARD_MODE_LLI_ITEMS 2  // 2 LLI items for wrap-around scrolling
-#define DMA_ALIGNMENT_BYTES 16     // DMA requires 16-byte alignment (8 pixels in RGB565)
+// Every frame is fed as exactly this many DMA blocks: the DSI bridge is told
+// the count once (mipi_dsi_brg_ll_set_multi_block_number), so it cannot vary
+// from frame to frame.  The layout's natural pieces (top band, window to the
+// ring's end, window after the wrap, bottom band -- at most four) are split
+// until there are this many.  Six also keeps every block at 360 rows or fewer,
+// the size the original two-block layout ran at.
+#define DPI_LLI_ITEMS 6
 
 // Debug counters
 static volatile uint32_t g_frame_count = 0;
@@ -95,113 +106,67 @@ struct esp_lcd_dpi_panel_t {
     esp_lcd_dpi_panel_refresh_done_cb_t on_refresh_done;
     void *user_ctx;
 
-    // Scroll state - pending values applied at frame boundary to avoid tearing
-    volatile int scroll_y;           // Current Y scroll offset in rows
-    volatile int pending_scroll_y;
-    volatile bool scroll_y_pending;
-
-    volatile int scroll_x_pixels;    // Current X scroll offset in pixels (must be 8-pixel aligned)
-    volatile int pending_scroll_x_pixels;
-    volatile bool scroll_x_pending;
+    // Scan-out layout (see chipguy_lcd_dpi_panel_set_layout).  The pending
+    // copy is applied at the next frame boundary, so a change never tears.
+    chipguy_lcd_dpi_layout_t layout;
+    chipguy_lcd_dpi_layout_t pending_layout;
+    volatile bool layout_pending;
+    portMUX_TYPE layout_lock;     // pending_layout / layout_pending, ISR vs task
 };
 
-// Helper to configure LLIs for scrolling with fully circular framebuffer
-// Treats the entire framebuffer as a circular buffer of bytes
+// Build framebuffer `fb_index`'s descriptor list for one frame, from the
+// current layout.  Rows are 1440 bytes on this panel, so every block start and
+// length is a multiple of the DMA's 16-byte alignment.
+typedef struct { uint32_t row, n; } dpi_seg_t;
+
 IRAM_ATTR
-static void configure_lli_for_scroll(esp_lcd_dpi_panel_t *dpi_panel,
-                                      int lli_index,
-                                      int scroll_y,
-                                      int scroll_x_bytes)
+static void configure_frame_llis(esp_lcd_dpi_panel_t *dpi_panel, uint8_t fb_index)
 {
-    uint8_t fb_index = dpi_panel->cur_fb_index;
-    dw_gdma_link_list_handle_t link_list = dpi_panel->link_lists[fb_index];
-    uint8_t *fb_start = dpi_panel->fbs[fb_index];
+    const chipguy_lcd_dpi_layout_t *l = &dpi_panel->layout;
+    uint32_t bottom = dpi_panel->v_pixels - l->top - l->window;
+    dpi_seg_t seg[DPI_LLI_ITEMS];
+    int k = 0;
 
-    // Calculate linear byte offset into framebuffer (circular)
-    size_t fb_size = dpi_panel->fb_size;
-    size_t start_offset = (scroll_y * dpi_panel->bytes_per_row + scroll_x_bytes) % fb_size;
+    if (l->top) seg[k++] = (dpi_seg_t){ 0, l->top };
+    uint32_t first = l->ring - l->offset;               // window rows before the wrap
+    if (first > l->window) first = l->window;
+    seg[k++] = (dpi_seg_t){ l->top + l->offset, first };
+    if (l->window > first) seg[k++] = (dpi_seg_t){ l->top, l->window - first };
+    if (bottom) seg[k++] = (dpi_seg_t){ l->top + l->ring, bottom };
 
-    // Total bytes to display per frame
-    size_t display_bytes = dpi_panel->v_pixels * dpi_panel->bytes_per_row;
-
-    // Bytes until wrap-around
-    size_t bytes_until_wrap = fb_size - start_offset;
-
-    dw_gdma_lli_handle_t lli = dw_gdma_link_list_get_item(link_list, lli_index);
-
-    if (bytes_until_wrap >= display_bytes) {
-        // No wrap needed - split into 2 halves for DMA efficiency
-        size_t half_bytes = (display_bytes / 2) & ~15;  // Align to 16 bytes
-
-        if (lli_index == 0) {
-            dw_gdma_block_transfer_config_t cfg = {
-                .src = { .addr = (uint32_t)(fb_start + start_offset),
-                         .burst_mode = DW_GDMA_BURST_MODE_INCREMENT,
-                         .burst_items = DW_GDMA_BURST_ITEMS_512, .burst_len = 16,
-                         .width = DW_GDMA_TRANS_WIDTH_64 },
-                .dst = { .addr = MIPI_DSI_BRG_MEM_BASE,
-                         .burst_mode = DW_GDMA_BURST_MODE_FIXED,
-                         .burst_items = DW_GDMA_BURST_ITEMS_256, .burst_len = 16,
-                         .width = DW_GDMA_TRANS_WIDTH_64 },
-                .size = half_bytes * 8 / 64,
-            };
-            dw_gdma_lli_config_transfer(lli, &cfg);
-            dw_gdma_lli_set_block_markers(lli, (dw_gdma_block_markers_t){.is_valid=true, .is_last=false});
-        } else {
-            dw_gdma_block_transfer_config_t cfg = {
-                .src = { .addr = (uint32_t)(fb_start + start_offset + half_bytes),
-                         .burst_mode = DW_GDMA_BURST_MODE_INCREMENT,
-                         .burst_items = DW_GDMA_BURST_ITEMS_512, .burst_len = 16,
-                         .width = DW_GDMA_TRANS_WIDTH_64 },
-                .dst = { .addr = MIPI_DSI_BRG_MEM_BASE,
-                         .burst_mode = DW_GDMA_BURST_MODE_FIXED,
-                         .burst_items = DW_GDMA_BURST_ITEMS_256, .burst_len = 16,
-                         .width = DW_GDMA_TRANS_WIDTH_64 },
-                .size = (display_bytes - half_bytes) * 8 / 64,
-            };
-            dw_gdma_lli_config_transfer(lli, &cfg);
-            dw_gdma_lli_set_block_markers(lli, (dw_gdma_block_markers_t){.is_valid=true, .is_last=true});
-        }
-    } else {
-        // Wrap needed - LLI 0 reads to end of buffer, LLI 1 wraps to start
-        size_t bytes_part1 = bytes_until_wrap & ~15;  // Align to 16 bytes
-        size_t bytes_part2 = display_bytes - bytes_part1;
-
-        if (lli_index == 0) {
-            dw_gdma_block_transfer_config_t cfg = {
-                .src = { .addr = (uint32_t)(fb_start + start_offset),
-                         .burst_mode = DW_GDMA_BURST_MODE_INCREMENT,
-                         .burst_items = DW_GDMA_BURST_ITEMS_512, .burst_len = 16,
-                         .width = DW_GDMA_TRANS_WIDTH_64 },
-                .dst = { .addr = MIPI_DSI_BRG_MEM_BASE,
-                         .burst_mode = DW_GDMA_BURST_MODE_FIXED,
-                         .burst_items = DW_GDMA_BURST_ITEMS_256, .burst_len = 16,
-                         .width = DW_GDMA_TRANS_WIDTH_64 },
-                .size = bytes_part1 * 8 / 64,
-            };
-            dw_gdma_lli_config_transfer(lli, &cfg);
-            dw_gdma_lli_set_block_markers(lli, (dw_gdma_block_markers_t){.is_valid=true, .is_last=false});
-        } else {
-            dw_gdma_block_transfer_config_t cfg = {
-                .src = { .addr = (uint32_t)fb_start,  // Wrap to start of buffer
-                         .burst_mode = DW_GDMA_BURST_MODE_INCREMENT,
-                         .burst_items = DW_GDMA_BURST_ITEMS_512, .burst_len = 16,
-                         .width = DW_GDMA_TRANS_WIDTH_64 },
-                .dst = { .addr = MIPI_DSI_BRG_MEM_BASE,
-                         .burst_mode = DW_GDMA_BURST_MODE_FIXED,
-                         .burst_items = DW_GDMA_BURST_ITEMS_256, .burst_len = 16,
-                         .width = DW_GDMA_TRANS_WIDTH_64 },
-                .size = bytes_part2 * 8 / 64,
-            };
-            dw_gdma_lli_config_transfer(lli, &cfg);
-            dw_gdma_lli_set_block_markers(lli, (dw_gdma_block_markers_t){.is_valid=true, .is_last=true});
-        }
+    // Split the largest piece until there are exactly DPI_LLI_ITEMS.
+    while (k < DPI_LLI_ITEMS) {
+        int big = 0;
+        for (int i = 1; i < k; i++) if (seg[i].n > seg[big].n) big = i;
+        uint32_t a = seg[big].n / 2;
+        for (int i = k; i > big + 1; i--) seg[i] = seg[i - 1];
+        seg[big + 1] = (dpi_seg_t){ seg[big].row + a, seg[big].n - a };
+        seg[big].n = a;
+        k++;
     }
 
-    // Re-link LLI 0 -> LLI 1
-    if (lli_index == 0) {
-        dw_gdma_lli_handle_t lli1 = dw_gdma_link_list_get_item(link_list, 1);
-        dw_gdma_lli_set_next(lli, lli1);
+    dw_gdma_link_list_handle_t link_list = dpi_panel->link_lists[fb_index];
+    uint8_t *fb = dpi_panel->fbs[fb_index];
+    size_t bpr = dpi_panel->bytes_per_row;
+    for (int i = 0; i < DPI_LLI_ITEMS; i++) {
+        dw_gdma_block_transfer_config_t cfg = {
+            .src = { .addr = (uint32_t)(fb + seg[i].row * bpr),
+                     .burst_mode = DW_GDMA_BURST_MODE_INCREMENT,
+                     .burst_items = DW_GDMA_BURST_ITEMS_512, .burst_len = 16,
+                     .width = DW_GDMA_TRANS_WIDTH_64 },
+            .dst = { .addr = MIPI_DSI_BRG_MEM_BASE,
+                     .burst_mode = DW_GDMA_BURST_MODE_FIXED,
+                     .burst_items = DW_GDMA_BURST_ITEMS_256, .burst_len = 16,
+                     .width = DW_GDMA_TRANS_WIDTH_64 },
+            .size = seg[i].n * bpr * 8 / 64,
+        };
+        dw_gdma_lli_handle_t lli = dw_gdma_link_list_get_item(link_list, i);
+        dw_gdma_lli_config_transfer(lli, &cfg);
+        if (i < DPI_LLI_ITEMS - 1) {
+            dw_gdma_lli_set_next(lli, dw_gdma_link_list_get_item(link_list, i + 1));
+        }
+        dw_gdma_lli_set_block_markers(lli, (dw_gdma_block_markers_t){
+            .is_valid = true, .is_last = (i == DPI_LLI_ITEMS - 1) });
     }
 }
 
@@ -222,25 +187,17 @@ static bool dma_full_trans_done_cb(dw_gdma_channel_handle_t chan, const dw_gdma_
 
     g_frame_count++;
 
-    // Apply pending scroll values at frame boundary
-    if (dpi_panel->scroll_y_pending) {
-        dpi_panel->scroll_y = dpi_panel->pending_scroll_y;
-        dpi_panel->scroll_y_pending = false;
+    // Apply a pending layout at the frame boundary
+    portENTER_CRITICAL_ISR(&dpi_panel->layout_lock);
+    if (dpi_panel->layout_pending) {
+        dpi_panel->layout = dpi_panel->pending_layout;
+        dpi_panel->layout_pending = false;
     }
-    if (dpi_panel->scroll_x_pending) {
-        dpi_panel->scroll_x_pixels = dpi_panel->pending_scroll_x_pixels;
-        dpi_panel->scroll_x_pending = false;
-    }
+    portEXIT_CRITICAL_ISR(&dpi_panel->layout_lock);
 
-    // Convert X scroll from pixels to bytes (must be 16-byte aligned)
-    int scroll_x_bytes = (dpi_panel->scroll_x_pixels * dpi_panel->bits_per_pixel / 8);
-
-    // Configure both LLIs for next frame
-    configure_lli_for_scroll(dpi_panel, 0, dpi_panel->scroll_y, scroll_x_bytes);
-    configure_lli_for_scroll(dpi_panel, 1, dpi_panel->scroll_y, scroll_x_bytes);
-
-    // Restart DMA
+    // Rebuild the current framebuffer's list for the next frame and restart
     uint8_t fb_index = dpi_panel->cur_fb_index;
+    configure_frame_llis(dpi_panel, fb_index);
     dw_gdma_link_list_handle_t link_list = dpi_panel->link_lists[fb_index];
     dw_gdma_channel_use_link_list(chan, link_list);
     dw_gdma_channel_enable_ctrl(chan, true);
@@ -298,9 +255,9 @@ static esp_err_t dpi_panel_create_dma_link(esp_lcd_dpi_panel_t *dpi_panel)
     ESP_RETURN_ON_ERROR(dw_gdma_new_channel(&dma_alloc_config, &dma_chan), TAG, "create DMA channel failed");
     dpi_panel->dma_chan = dma_chan;
 
-    // Create linked list with 2 items for wrap-around scrolling
+    // One list per framebuffer, rebuilt every frame (configure_frame_llis)
     dw_gdma_link_list_config_t link_list_config = {
-        .num_items = STANDARD_MODE_LLI_ITEMS,
+        .num_items = DPI_LLI_ITEMS,
         .link_type = DW_GDMA_LINKED_LIST_TYPE_SINGLY,
     };
     for (int i = 0; i < dpi_panel->num_fbs; i++) {
@@ -318,7 +275,7 @@ static esp_err_t dpi_panel_create_dma_link(esp_lcd_dpi_panel_t *dpi_panel)
 
 esp_err_t chipguy_lcd_new_panel_dpi(esp_lcd_dsi_bus_handle_t bus, const chipguy_lcd_dpi_panel_config_t *panel_config, esp_lcd_panel_handle_t *ret_panel)
 {
-    ESP_LOGI(TAG, "Creating DPI panel with hardware scrolling support");
+    ESP_LOGI(TAG, "Creating DPI panel (page flip + hardware scrolling)");
 
     esp_err_t ret = ESP_OK;
     esp_lcd_dpi_panel_t *dpi_panel = NULL;
@@ -359,6 +316,18 @@ esp_err_t chipguy_lcd_new_panel_dpi(esp_lcd_dsi_bus_handle_t bus, const chipguy_
     int bus_id = bus->bus_id;
     mipi_dsi_hal_context_t *hal = &bus->hal;
 
+    // esp_lcd_dsi_bus_t (top of this file) is a copy of a private ESP-IDF struct, but
+    // the bus object itself was built by IDF's esp_lcd_new_dsi_bus().  If IDF ever
+    // reorders that struct, bus_id/hal read garbage and the panel would drive DSI
+    // through bad register pointers.  Check them against what IDF's HAL init stores
+    // (MIPI_DSI_LL_GET_HOST/GET_BRG of the bus id) and refuse the bus if they differ.
+    ESP_RETURN_ON_FALSE(bus_id >= 0 && bus_id < MIPI_DSI_LL_NUM_BUS &&
+                        hal->host == MIPI_DSI_LL_GET_HOST(bus_id) &&
+                        hal->bridge == MIPI_DSI_LL_GET_BRG(bus_id),
+                        ESP_ERR_INVALID_STATE, TAG,
+                        "DSI bus object doesn't match this file's esp_lcd_dsi_bus_t copy "
+                        "(ESP-IDF layout changed?) -- update the struct from mipi_dsi_priv.h");
+
     ESP_LOGI(TAG, "Display: %lux%lu, Virtual height: %lu, FB size: %u bytes",
              panel_config->video_timing.h_size, display_height, virtual_height, fb_size);
 
@@ -377,13 +346,10 @@ esp_err_t chipguy_lcd_new_panel_dpi(esp_lcd_dsi_bus_handle_t bus, const chipguy_
     dpi_panel->fb_size = fb_size;
     dpi_panel->bits_per_pixel = bits_per_pixel;
 
-    // Initialize scroll state
-    dpi_panel->scroll_y = 0;
-    dpi_panel->pending_scroll_y = 0;
-    dpi_panel->scroll_y_pending = false;
-    dpi_panel->scroll_x_pixels = 0;
-    dpi_panel->pending_scroll_x_pixels = 0;
-    dpi_panel->scroll_x_pending = false;
+    // Plain layout: the first v_pixels rows, top to bottom, no scrolling
+    dpi_panel->layout = (chipguy_lcd_dpi_layout_t){ 0, display_height, display_height, 0 };
+    dpi_panel->layout_pending = false;
+    portMUX_INITIALIZE(&dpi_panel->layout_lock);
 
     // Allocate framebuffer(s)
     dpi_panel->num_fbs = panel_config->num_fbs > 0 ? panel_config->num_fbs : 1;
@@ -455,7 +421,7 @@ esp_err_t chipguy_lcd_new_panel_dpi(esp_lcd_dsi_bus_handle_t bus, const chipguy_
     mipi_dsi_brg_ll_set_input_color_format(hal->bridge, in_color_format);
     mipi_dsi_brg_ll_set_output_color_format(hal->bridge, out_color_format, 0);
     mipi_dsi_brg_ll_set_flow_controller(hal->bridge, MIPI_DSI_LL_FLOW_CONTROLLER_DMA);
-    mipi_dsi_brg_ll_set_multi_block_number(hal->bridge, STANDARD_MODE_LLI_ITEMS);
+    mipi_dsi_brg_ll_set_multi_block_number(hal->bridge, DPI_LLI_ITEMS);
     mipi_dsi_brg_ll_set_burst_len(hal->bridge, 256);
     mipi_dsi_brg_ll_set_empty_threshold(hal->bridge, 1024 - 256);
     mipi_dsi_brg_ll_enable(hal->bridge, true);
@@ -518,49 +484,9 @@ static esp_err_t dpi_panel_init(esp_lcd_panel_t *panel)
 
     ESP_LOGI(TAG, "Initializing DPI panel");
 
-    // Configure LLIs for initial display (no scroll)
-    size_t rows_per_lli = dpi_panel->v_pixels / STANDARD_MODE_LLI_ITEMS;
-    size_t bytes_per_lli = rows_per_lli * dpi_panel->bytes_per_row;
-
+    // Descriptor lists for the initial (plain) layout
     for (int i = 0; i < dpi_panel->num_fbs; i++) {
-        dw_gdma_link_list_handle_t link_list = dpi_panel->link_lists[i];
-        uint8_t *fb_base = dpi_panel->fbs[i];
-
-        for (int lli_idx = 0; lli_idx < STANDARD_MODE_LLI_ITEMS; lli_idx++) {
-            uint8_t *src_addr = fb_base + (lli_idx * bytes_per_lli);
-
-            dw_gdma_block_transfer_config_t dma_transfer_config = {
-                .src = {
-                    .addr = (uint32_t)src_addr,
-                    .burst_mode = DW_GDMA_BURST_MODE_INCREMENT,
-                    .burst_items = DW_GDMA_BURST_ITEMS_512,
-                    .burst_len = 16,
-                    .width = DW_GDMA_TRANS_WIDTH_64,
-                },
-                .dst = {
-                    .addr = MIPI_DSI_BRG_MEM_BASE,
-                    .burst_mode = DW_GDMA_BURST_MODE_FIXED,
-                    .burst_items = DW_GDMA_BURST_ITEMS_256,
-                    .burst_len = 16,
-                    .width = DW_GDMA_TRANS_WIDTH_64,
-                },
-                .size = bytes_per_lli * 8 / 64,
-            };
-
-            dw_gdma_lli_handle_t lli = dw_gdma_link_list_get_item(link_list, lli_idx);
-            dw_gdma_lli_config_transfer(lli, &dma_transfer_config);
-
-            if (lli_idx < STANDARD_MODE_LLI_ITEMS - 1) {
-                dw_gdma_lli_handle_t next_lli = dw_gdma_link_list_get_item(link_list, lli_idx + 1);
-                dw_gdma_lli_set_next(lli, next_lli);
-            }
-
-            dw_gdma_block_markers_t markers = {
-                .is_valid = true,
-                .is_last = (lli_idx == STANDARD_MODE_LLI_ITEMS - 1),
-            };
-            dw_gdma_lli_set_block_markers(lli, markers);
-        }
+        configure_frame_llis(dpi_panel, i);
     }
 
     dpi_panel->cur_fb_index = 0;
@@ -647,51 +573,29 @@ esp_err_t chipguy_lcd_dpi_panel_get_frame_buffer(esp_lcd_panel_handle_t panel, u
     return ESP_OK;
 }
 
-void chipguy_lcd_dpi_panel_set_scroll(esp_lcd_panel_handle_t panel, int x_pixels, int y_rows)
+esp_err_t chipguy_lcd_dpi_panel_set_layout(esp_lcd_panel_handle_t panel,
+                                           const chipguy_lcd_dpi_layout_t *layout)
 {
-    if (!panel) return;
+    ESP_RETURN_ON_FALSE(panel && layout, ESP_ERR_INVALID_ARG, TAG, "invalid argument");
     esp_lcd_dpi_panel_t *dpi_panel = __containerof(panel, esp_lcd_dpi_panel_t, base);
-
-    // Normalize Y to [0, virtual_v_pixels)
-    int virtual_height = dpi_panel->virtual_v_pixels;
-    y_rows = y_rows % virtual_height;
-    if (y_rows < 0) y_rows += virtual_height;
-
-    // X must be 8-pixel aligned (16-byte alignment for RGB565)
-    // Round to nearest 8 pixels
-    x_pixels = (x_pixels / 8) * 8;
-
-    // Clamp X to valid range (no wrap-around for X)
-    if (x_pixels < 0) x_pixels = 0;
-    // Don't allow X scroll beyond what keeps display on-screen
-    // (For now, just clamp to 0 - full X scrolling would need wider framebuffer)
-
-    // Set pending values - ISR will apply at next frame boundary
-    dpi_panel->pending_scroll_y = y_rows;
-    dpi_panel->scroll_y_pending = true;
-
-    dpi_panel->pending_scroll_x_pixels = x_pixels;
-    dpi_panel->scroll_x_pending = true;
+    uint32_t v = dpi_panel->v_pixels;
+    ESP_RETURN_ON_FALSE(layout->window >= 1 && layout->top + layout->window <= v &&
+                        layout->ring >= layout->window && layout->offset < layout->ring &&
+                        layout->top + layout->ring + (v - layout->top - layout->window)
+                            <= dpi_panel->virtual_v_pixels,
+                        ESP_ERR_INVALID_ARG, TAG, "layout does not fit the framebuffer");
+    portENTER_CRITICAL(&dpi_panel->layout_lock);
+    dpi_panel->pending_layout = *layout;
+    dpi_panel->layout_pending = true;
+    portEXIT_CRITICAL(&dpi_panel->layout_lock);
+    return ESP_OK;
 }
 
-void chipguy_lcd_dpi_panel_set_scroll_y(esp_lcd_panel_handle_t panel, int y_rows)
-{
-    if (!panel) return;
-    esp_lcd_dpi_panel_t *dpi_panel = __containerof(panel, esp_lcd_dpi_panel_t, base);
-
-    int virtual_height = dpi_panel->virtual_v_pixels;
-    y_rows = y_rows % virtual_height;
-    if (y_rows < 0) y_rows += virtual_height;
-
-    dpi_panel->pending_scroll_y = y_rows;
-    dpi_panel->scroll_y_pending = true;
-}
-
-bool chipguy_lcd_dpi_panel_is_scroll_pending(esp_lcd_panel_handle_t panel)
+bool chipguy_lcd_dpi_panel_is_layout_pending(esp_lcd_panel_handle_t panel)
 {
     if (!panel) return false;
     esp_lcd_dpi_panel_t *dpi_panel = __containerof(panel, esp_lcd_dpi_panel_t, base);
-    return dpi_panel->scroll_y_pending || dpi_panel->scroll_x_pending;
+    return dpi_panel->layout_pending;
 }
 
 uint32_t chipguy_lcd_dpi_panel_get_frame_count(void)

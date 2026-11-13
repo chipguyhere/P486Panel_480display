@@ -1,14 +1,9 @@
 /*
- * SPDX-FileCopyrightText: 2024 chipguyhere
+ * SPDX-FileCopyrightText: 2024-2026 chipguyhere
  * SPDX-License-Identifier: Apache-2.0
  *
- * ESP32-P4 MIPI DSI DPI Panel Driver with Hardware Scrolling
- * Forked from ESP-IDF esp_lcd_panel_dpi.c
- *
- * Supports:
- * - Hardware vertical scrolling (any row offset, wrap-around)
- * - Hardware horizontal scrolling (8-pixel granularity due to 16-byte DMA alignment)
- * - Virtual framebuffer for pre-drawing content ahead of scroll position
+ * ESP32-P4 MIPI DSI DPI Panel Driver with page flipping and hardware scrolling.
+ * Forked from ESP-IDF esp_lcd_panel_dpi.c; see the .c file for what changed.
  */
 
 #pragma once
@@ -43,7 +38,7 @@ typedef struct {
     lcd_color_format_t out_color_format;
     uint8_t num_fbs;  // Number of framebuffers
     esp_lcd_video_timing_t video_timing;
-    uint32_t virtual_v_pixels;     // Virtual framebuffer height for scrolling (0 = same as display height)
+    uint32_t virtual_v_pixels;     // Framebuffer height in rows, >= the panel's (0 = same as the panel)
     struct {
         uint32_t use_dma2d: 1;
         uint32_t disable_lp: 1;
@@ -95,46 +90,41 @@ esp_err_t chipguy_lcd_dpi_panel_get_frame_buffer(
 );
 
 /**
- * @brief Set scroll position (both X and Y)
+ * @brief How each frame is read out of the framebuffer (rows, top to bottom)
  *
- * X scrolling requires 8-pixel alignment due to 16-byte DMA alignment requirement.
- * The X value will be rounded down to the nearest 8-pixel boundary.
- * Y scrolling supports any row offset with automatic wrap-around.
- *
- * @param panel Panel handle
- * @param x_pixels X scroll offset in pixels (will be aligned to 8-pixel boundary)
- * @param y_rows Y scroll offset in rows (wraps within virtual_v_pixels)
+ * The panel shows, in order:
+ *   1. rows [0, top) of the framebuffer -- a frozen top band;
+ *   2. `window` rows taken from a ring of `ring` rows that starts at framebuffer
+ *      row `top`, beginning `offset` rows into the ring and wrapping round its
+ *      end -- the scrolling area;
+ *   3. the remaining (v_pixels - top - window) rows from framebuffer row
+ *      top + ring onward -- a frozen bottom band.
+ * The plain layout is { 0, v_pixels, v_pixels, 0 }.  A ring longer than the
+ * window holds rows that are not on screen, to draw into before they scroll in;
+ * the framebuffer must then be taller than the panel (virtual_v_pixels).
  */
-void chipguy_lcd_dpi_panel_set_scroll(
+typedef struct {
+    uint32_t top;
+    uint32_t ring;
+    uint32_t window;
+    uint32_t offset;
+} chipguy_lcd_dpi_layout_t;
+
+/**
+ * @brief Change the layout, effective from the next frame boundary (no tearing)
+ *
+ * Scrolling is a change of `offset` alone.  Applies to whichever framebuffer is
+ * active.  Returns ESP_ERR_INVALID_ARG if the layout does not fit.
+ */
+esp_err_t chipguy_lcd_dpi_panel_set_layout(
     esp_lcd_panel_handle_t panel,
-    int x_pixels,
-    int y_rows
+    const chipguy_lcd_dpi_layout_t *layout
 );
 
 /**
- * @brief Set Y scroll offset only (vertical scrolling)
- *
- * The y_offset wraps within virtual_v_pixels automatically.
- * This is the most common scrolling operation for text displays.
- *
- * @param panel Panel handle
- * @param y_rows Y offset in rows (0 to virtual_v_pixels-1)
+ * @brief True until the frame boundary that applies the last set_layout()
  */
-void chipguy_lcd_dpi_panel_set_scroll_y(
-    esp_lcd_panel_handle_t panel,
-    int y_rows
-);
-
-/**
- * @brief Check if a scroll change is still pending
- *
- * Scroll changes are applied at frame boundaries to avoid tearing.
- * This function checks if there's a pending scroll waiting to be applied.
- *
- * @param panel Panel handle
- * @return true if there's a pending scroll waiting to be applied at next frame
- */
-bool chipguy_lcd_dpi_panel_is_scroll_pending(esp_lcd_panel_handle_t panel);
+bool chipguy_lcd_dpi_panel_is_layout_pending(esp_lcd_panel_handle_t panel);
 
 /**
  * @brief Get the virtual framebuffer height
@@ -193,7 +183,8 @@ bool chipguy_lcd_dpi_panel_wait_vsync(uint32_t timeout_ms);
 /**
  * @brief Set active framebuffer for display
  *
- * Switches which framebuffer is being displayed. This resets scroll to (0,0).
+ * Switches which framebuffer is being displayed, from the next frame boundary.
+ * The layout is unchanged.
  * Use this for double-buffering with LVGL or similar graphics libraries.
  *
  * @param panel Panel handle

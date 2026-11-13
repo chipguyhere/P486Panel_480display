@@ -9,7 +9,7 @@
  * This stub doubles as a bring-up test:
  *   - "Hello, world!" follows your finger, centered on the touch point, so you
  *     can confirm touch coordinates line up with the display.  This is also the
- *     quickest way to check a rotated build: uncomment display.setRotation(90)
+ *     quickest way to check a rotated build: uncomment display.setRotation(270)
  *     in the sketch and the label should still track your finger exactly.
  *   - A rectangle cycles RED -> GREEN -> BLUE once per second so you can verify
  *     the panel's color order and timing are correct.
